@@ -523,18 +523,42 @@ async function runBiliMangaGrabber() {
     ).join(', '));
   };
 
+  // 把 waitForNewStablePage 的内部计时拼成单行日志后缀
+  //   total: 从 PageDown 到截图返回的全程
+  //   pn:  从开始到 .current-page 数字翻过去（reader 真正翻页的耗时；A→B 是页号变化）
+  //   sig: 翻页确认后到 canvas sig 稳定的耗时（WASM 渲染 + 等过渡帧收敛）
+  //   blobs: 累计 toBlob 次数 + 总编码毫秒；transients: 翻页后看到的不同过渡 sig 数
+  const formatWaitDebug = (d) => {
+    if (!d) return '';
+    const pnPart = d.pnFrom !== null && d.pnTo !== null
+      ? ' pn=' + d.pnFrom + '→' + d.pnTo + '@' + d.pnWaitMs + 'ms'
+      : (d.pnFrom !== null ? ' pn=?@' + d.pnWaitMs + 'ms' : '');
+    return ' [total=' + d.totalMs + 'ms' + pnPart +
+        ' sig=' + d.sigWaitMs + 'ms(stab=' + d.requiredStableMs + ')' +
+        ' blobs=' + d.blobs + '@' + d.blobMs + 'ms' +
+        ' transients=' + d.transients +
+        (d.prevSigSeen ? ' prevSig=' + d.prevSigSeen : '') + ']';
+  };
+
   // 等待新页面渲染完成：
   //   1) 如有 prevPageNum：先轮询 .current-page 直到数字变化（DOM 读取近乎免费，不烧 toBlob）
   //   2) sig 必须与 prevSig 不同（说明翻到了新页）
   //   3) 新 sig 必须连续 stableMs 毫秒不变（页号已经确认翻页时窗口缩短到 200ms）
-  // 返回 { bytes, sig, size }、{ crossedEp } 或 null（超时）
+  // 返回 { bytes, sig, size, debug }、{ crossedEp } 或 null（超时）
   const waitForNewStablePage = async (prevSig, maxMs, stableMs, expectedEp, prevPageNum) => {
     const start = Date.now();
     const hasPageNum = typeof prevPageNum === 'number';
     let pageNumChanged = false;
+    let pageNumChangedAt = 0;
+    let pageNumAfter = null;
     let nullPageNumStreak = 0;
     let currentSig = null;
     let stableSince = 0;
+    let transientSigs = 0;
+    let toBlobMs = 0;
+    let numCaptures = 0;
+    let pageNumPolls = 0;
+    let prevSigSeen = 0;
     while (Date.now() - start < maxMs) {
       await sleep(80);
       const currentEp = getEpFromUrl();
@@ -544,6 +568,7 @@ async function runBiliMangaGrabber() {
       // 廉价信号：reader 没把页号翻过去之前，跳过昂贵的 toBlob
       if (hasPageNum && !pageNumChanged) {
         const num = getCurrentPageNumberFast();
+        pageNumPolls++;
         if (num === null) {
           if (++nullPageNumStreak < 5) continue;
           // 指示器丢失，落回到纯 sig 检测
@@ -551,19 +576,41 @@ async function runBiliMangaGrabber() {
           continue;  // 还停在上一页
         } else {
           pageNumChanged = true;
+          pageNumChangedAt = Date.now();
+          pageNumAfter = num;
         }
       }
+      const blobStart = Date.now();
       const capture = await captureCanvasBytes();
+      toBlobMs += Date.now() - blobStart;
+      numCaptures++;
       if (!capture) continue;
       const sig = capture.sig;
       if (sig === prevSig) {
+        prevSigSeen++;
         currentSig = null; stableSince = 0;
         continue;
       }
       const requiredStable = pageNumChanged ? Math.min(200, stableMs) : stableMs;
       if (sig === currentSig) {
-        if (Date.now() - stableSince >= requiredStable) return capture;
+        if (Date.now() - stableSince >= requiredStable) {
+          capture.debug = {
+            totalMs: Date.now() - start,
+            pnWaitMs: pageNumChangedAt ? pageNumChangedAt - start : 0,
+            sigWaitMs: pageNumChangedAt ? Date.now() - pageNumChangedAt : Date.now() - start,
+            pnPolls: pageNumPolls,
+            pnFrom: hasPageNum ? prevPageNum : null,
+            pnTo: pageNumAfter,
+            blobs: numCaptures,
+            blobMs: toBlobMs,
+            transients: transientSigs,
+            prevSigSeen,
+            requiredStableMs: requiredStable,
+          };
+          return capture;
+        }
       } else {
+        if (currentSig !== null) transientSigs++;
         currentSig = sig;
         stableSince = Date.now();
       }
@@ -725,7 +772,8 @@ async function runBiliMangaGrabber() {
     captures.push({ bytes: first.bytes, sig: first.sig });
     seenSigs.add(first.sig);
     lastSig = first.sig;
-    log('captured page 1 (' + Math.round((first.size || first.bytes.byteLength) / 1024) + 'KB)');
+    log('captured page 1 (' + Math.round((first.size || first.bytes.byteLength) / 1024) + 'KB)' +
+        formatWaitDebug(first.debug));
 
     // 翻页 + 截图
     let stallCount = 0;
@@ -762,7 +810,8 @@ async function runBiliMangaGrabber() {
         lastSig = next.sig;
         stallCount = 0;
         log('captured page ' + captures.length + ' (' +
-            Math.round((next.size || next.bytes.byteLength) / 1024) + 'KB)');
+            Math.round((next.size || next.bytes.byteLength) / 1024) + 'KB)' +
+            formatWaitDebug(next.debug));
       } else {
         stallCount++;
         warn('no new stable page (stall ' + stallCount + '/3)');
