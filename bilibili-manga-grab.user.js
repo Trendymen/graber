@@ -83,35 +83,70 @@ function sanitizeFileName(s, fallback) {
 
 function getMangaNameFromTitle(title) {
   const raw = String(title || '').trim();
-  const parts = raw
-    .replace(/\s*[-—｜|]\s*(哔哩哔哩漫画|bilibili.*)$/i, '')
-    .split(/\s*[-—｜|]\s*/)
-    .map(s => s.trim())
-    .filter(Boolean);
+  const stripped = raw.replace(/\s*[-—｜|]\s*(哔哩哔哩漫画|bilibili.*)$/i, '').trim();
+  const parts = stripped.split(/\s*[-—｜|]\s*/).map(s => s.trim()).filter(Boolean);
+  const isSiteText = (p) => /(漫画全集在线观看|全集在线观看|在线观看|哔哩哔哩漫画|bilibili)/i.test(p);
   const isBadCandidate = (p) =>
-    !p ||
-    /^\d+$/.test(p) ||                                              // 纯数字（避免回退到 ep_id / 话号）
-    getChapterNumberFromTitle(p) ||                                 // 含"第 N 话"
-    /(漫画全集在线观看|全集在线观看|在线观看|哔哩哔哩漫画|bilibili)/i.test(p);
+    !p || /^\d+$/.test(p) || getChapterNumberFromTitle(p) || isSiteText(p);
+
+  // 1) 任何一个 part 本身就是干净的漫画名（不带话号、不是数字、不是站名）
   const picked = parts.find(p => !isBadCandidate(p));
-  const fallback = parts.find(p => !/^\d+$/.test(p)) || parts[0] || raw;
-  return sanitizeFileName(picked || fallback || 'manga', 'manga');
+  if (picked) return sanitizeFileName(picked, 'manga');
+
+  // 2) 从含话号的段里剥出漫画名前缀：'漫画名 第139话 章节名' → '漫画名'
+  const chapterRe = /第\s*[零〇一二两三四五六七八九十百千0-9]+\s*[话話章回]/;
+  for (const p of parts) {
+    if (isSiteText(p)) continue;
+    const m = p.split(chapterRe)[0].trim();
+    // 也剥掉前导的 'N - ' / 'N_' 这种数字前缀
+    const cleaned = m.replace(/^\s*\d+\s*[-—｜|_:：]\s*/, '').trim();
+    if (cleaned && cleaned.length >= 2 && !/^\d+$/.test(cleaned) && !isSiteText(cleaned)) {
+      return sanitizeFileName(cleaned, 'manga');
+    }
+  }
+
+  // 3) 整体兜底：去掉话号后剩下的非数字内容
+  const wholeCleaned = stripped
+    .split(chapterRe)[0]
+    .replace(/^\s*\d+\s*[-—｜|_:：]\s*/, '')
+    .trim();
+  if (wholeCleaned && wholeCleaned.length >= 2 && !/^\d+$/.test(wholeCleaned)) {
+    return sanitizeFileName(wholeCleaned, 'manga');
+  }
+
+  // 4) 最后回退到非纯数字的 part / 原始字符串
+  const fallback = parts.find(p => !/^\d+$/.test(p) && !isSiteText(p)) || parts[0] || raw;
+  return sanitizeFileName(fallback || 'manga', 'manga');
 }
 
 // 从 reader UI 里抽漫画名（document.title 不可靠时的备用路径；bilibili 改 title 格式后这个更稳）
+// 实测精确路径：reader 顶部 navbar 里的 a.manga-title（同时带 title 属性，也可作为来源）
 function getMangaNameFromReader() {
   if (typeof document === 'undefined') return null;
+  // 优先 title 属性（不受文字截断 / 嵌套元素 textContent 干扰）
+  const titleAttrSelectors = ['a.manga-title', '.manga-title[title]'];
+  for (const sel of titleAttrSelectors) {
+    try {
+      const el = document.querySelector(sel);
+      const t = (el?.getAttribute?.('title') || '').trim();
+      if (t && t.length >= 2 && t.length <= 80 && !/^\d+$/.test(t) && !getChapterNumberFromTitle(t)) {
+        return sanitizeFileName(t, 'manga');
+      }
+    } catch (_) {}
+  }
+  // 否则取 textContent
   const selectors = [
-    // 用户已知精确路径附近的同级节点（info-text 第二个 div 是章节名 → 第一个 div 大概率是漫画名）
-    '.reader-layout .info-layer .info-hud .info-text > div:nth-child(1)',
-    '.info-hud .info-text > div:nth-child(1)',
-    '.info-text > div:nth-child(1)',
-    // 通用语义类
+    'a.manga-title',
+    '.manga-title',
     '[class*="manga-title"]',
     '[class*="comic-title"]',
     '[class*="book-title"]',
     '.book-name',
     '.comic-name',
+    // 旁路：info-text 第一个 div（章节标题在 nth-child(2)，第一个常是漫画名）
+    '.reader-layout .info-layer .info-hud .info-text > div:nth-child(1)',
+    '.info-hud .info-text > div:nth-child(1)',
+    '.info-text > div:nth-child(1)',
   ];
   for (const sel of selectors) {
     try {
