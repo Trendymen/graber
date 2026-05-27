@@ -383,11 +383,14 @@ async function runBiliMangaGrabber() {
 
   // 当前章节 ep_id（从 URL 提取），用于检测翻过头跨章
   const getEpFromUrl = () => location.pathname.split('/').filter(Boolean).pop();
-  // 从 reader UI 文本里抽取 "current/total" 页码指示（兼容 "1/62 P" 或 "1/62"）
+  // 从 reader UI 文本里抽取 "current/total" 页码指示
+  // 兼容：'1/62 P'、'1/62'、'第1页/共62页'、'1页/62页'、'1 / 62 P'
   const matchPageRatio = (text) => {
     if (!text) return null;
-    let m = text.match(/(\d+)\s*\/\s*(\d+)\s*P\b/i);
-    if (!m) m = text.match(/\b(\d+)\s*\/\s*(\d+)\b/);
+    let m = text.match(/(\d+)\s*[\/／]\s*(\d+)\s*P\b/i);
+    if (!m) m = text.match(/\b(\d+)\s*[\/／]\s*(\d+)\b/);
+    // 中文夹字：'1页/21页', '第1页 / 共21页', '1 / 共 21'
+    if (!m) m = text.match(/(\d+)[\s一-龥]{0,4}[\/／][\s一-龥]{0,4}(\d+)/);
     if (!m) return null;
     const current = Number(m[1]);
     const total = Number(m[2]);
@@ -395,9 +398,19 @@ async function runBiliMangaGrabber() {
     if (current < 1 || total < 1 || current > total) return null;
     return { current, total };
   };
-  // 优先在 info-hud 内查找页码（更精确，避免 body 里日期 "1/12" 误匹配）；找不到再回退到全页扫描
+  const getTotalFromBodyText = () => {
+    const text = document.body.innerText || '';
+    const m = text.match(/(\d+)\s*P\b/i);
+    return m ? Number(m[1]) : null;
+  };
+  // 优先在 info-hud 内查找页码（精确路径来自实测 DOM：.info-hud .hinter-image-container span）
+  // 容错：若节点内只有单个数字（仅 current），则与 body 文本里的 'NP' 总数拼出完整信息
   const getDisplayedPageInfo = () => {
     const containers = [
+      '.reader-layout .info-layer .info-hud .hinter-image-container span',
+      '.info-hud .hinter-image-container span',
+      '.hinter-image-container span',
+      '.info-hud .hinter-image-container',
       '.reader-layout .info-layer .info-hud',
       '.info-hud',
       '.info-text',
@@ -409,12 +422,19 @@ async function runBiliMangaGrabber() {
         const text = (root.textContent || '').replace(/\s+/g, ' ').trim();
         const info = matchPageRatio(text);
         if (info) return info;
+        // 单数字节点：用 body 总数补齐
+        const single = text.match(/^[^\d]{0,6}(\d+)[^\d]{0,6}$/);
+        if (single) {
+          const current = Number(single[1]);
+          const total = getTotalFromBodyText();
+          if (current >= 1 && total && current <= total) return { current, total };
+        }
       } catch (_) {}
     }
+    // 全页兜底：只接受带 P 的，避免日期等噪声
     try {
       const text = (document.body.innerText || '').replace(/\s+/g, ' ');
-      // 全页兜底只接受带 P 的，避免日期等噪声
-      const m = text.match(/\b(\d+)\s*\/\s*(\d+)\s*P\b/i);
+      const m = text.match(/\b(\d+)\s*[\/／]\s*(\d+)\s*P\b/i);
       if (m) {
         const current = Number(m[1]);
         const total = Number(m[2]);
@@ -426,9 +446,7 @@ async function runBiliMangaGrabber() {
   const getDisplayedTotalPages = () => {
     const info = getDisplayedPageInfo();
     if (info) return info.total;
-    const text = document.body.innerText || '';
-    const m = text.match(/(\d+)\s*P\b/i);
-    return m ? Number(m[1]) : null;
+    return getTotalFromBodyText();
   };
   const returnToEp = async (epId, preferredKey) => {
     if (getEpFromUrl() === epId) return true;
