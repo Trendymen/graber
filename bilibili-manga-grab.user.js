@@ -88,11 +88,42 @@ function getMangaNameFromTitle(title) {
     .split(/\s*[-—｜|]\s*/)
     .map(s => s.trim())
     .filter(Boolean);
-  const picked = parts.find(part =>
-    !getChapterNumberFromTitle(part) &&
-    !/(漫画全集在线观看|全集在线观看|在线观看|哔哩哔哩漫画|bilibili)/i.test(part)
-  );
-  return sanitizeFileName(picked || parts[0] || raw || 'manga', 'manga');
+  const isBadCandidate = (p) =>
+    !p ||
+    /^\d+$/.test(p) ||                                              // 纯数字（避免回退到 ep_id / 话号）
+    getChapterNumberFromTitle(p) ||                                 // 含"第 N 话"
+    /(漫画全集在线观看|全集在线观看|在线观看|哔哩哔哩漫画|bilibili)/i.test(p);
+  const picked = parts.find(p => !isBadCandidate(p));
+  const fallback = parts.find(p => !/^\d+$/.test(p)) || parts[0] || raw;
+  return sanitizeFileName(picked || fallback || 'manga', 'manga');
+}
+
+// 从 reader UI 里抽漫画名（document.title 不可靠时的备用路径；bilibili 改 title 格式后这个更稳）
+function getMangaNameFromReader() {
+  if (typeof document === 'undefined') return null;
+  const selectors = [
+    // 用户已知精确路径附近的同级节点（info-text 第二个 div 是章节名 → 第一个 div 大概率是漫画名）
+    '.reader-layout .info-layer .info-hud .info-text > div:nth-child(1)',
+    '.info-hud .info-text > div:nth-child(1)',
+    '.info-text > div:nth-child(1)',
+    // 通用语义类
+    '[class*="manga-title"]',
+    '[class*="comic-title"]',
+    '[class*="book-title"]',
+    '.book-name',
+    '.comic-name',
+  ];
+  for (const sel of selectors) {
+    try {
+      const el = document.querySelector(sel);
+      const t = (el?.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!t || t.length < 2 || t.length > 80) continue;
+      if (/^\d+$/.test(t)) continue;
+      if (getChapterNumberFromTitle(t)) continue;
+      return sanitizeFileName(t, 'manga');
+    } catch (_) {}
+  }
+  return null;
 }
 
 function makeChapterFolderName(title) {
@@ -330,8 +361,14 @@ async function runBiliMangaGrabber() {
       _initCanvases.map(c => c.width + 'x' + c.height).join(', ') + ']');
   if (_initCanvases.length === 0) { err('no canvas found'); return; }
 
-  // 漫画作品名（从 document.title 提取，去掉站点后缀）→ 用作分批 ZIP 文件名
-  const mangaName = getMangaNameFromTitle(document.title);
+  // 漫画作品名：优先从 reader UI 里抽（bilibili 改过 title 格式后更稳），其次回退到 document.title
+  const readerMangaName = getMangaNameFromReader();
+  const titleMangaName = getMangaNameFromTitle(document.title);
+  const mangaName = readerMangaName || titleMangaName;
+  log('document.title="' + document.title + '"');
+  log('manga name resolved to "' + mangaName + '" (reader=' +
+      (readerMangaName ? '"' + readerMangaName + '"' : 'null') +
+      ', title=' + (titleMangaName ? '"' + titleMangaName + '"' : 'null') + ')');
 
   // 当前章节标题（每话调用一次，需在话切换后给一点 reader 更新 DOM 的时间）
   // 优先从已知的 reader UI 标题位拿；fallback 用 document.title 中"第 N 话 ..."部分
