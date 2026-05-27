@@ -28,7 +28,7 @@
  *
  *  原理：
  *    - bilibili CDN 上的 .avif 实际是 WASM 加密字节，直接下载无法解码
- *    - 改为：iframe 取干净的 HTMLCanvasElement.prototype.toDataURL
+ *    - 改为：iframe 取干净的 HTMLCanvasElement.prototype.toBlob
  *      （reader 把它覆盖成 anti-screenshot 版本了）
  *    - PgUp 回本话首页 → 截图 → PgDn 翻页 → 截图（hash 去重 + 稳定性校验 + URL 跨章监测）
  *    - 单话结束后 PgDn 推进到下一话，循环；每批独立 JSZip + Blob URL 下载按钮
@@ -125,9 +125,9 @@ async function runBiliMangaGrabber() {
   try {
     if (!window.JSZip && typeof JSZip !== 'undefined') window.JSZip = JSZip;
   } catch (_) {}
-  // ============ 0. 从隐藏 iframe 拿干净的 console + toDataURL + Blob URL ============
+  // ============ 0. 从隐藏 iframe 拿干净的 console + toBlob + Blob URL ============
   let CC = console;
-  let rawToDataURL = HTMLCanvasElement.prototype.toDataURL;
+  let rawToBlob = HTMLCanvasElement.prototype.toBlob;
   let cleanURL = URL;
   let rawCreateObjectURL = URL.createObjectURL;
   let rawRevokeObjectURL = URL.revokeObjectURL;
@@ -140,7 +140,7 @@ async function runBiliMangaGrabber() {
     ifr.src = 'about:blank';
     document.documentElement.appendChild(ifr);
     CC = ifr.contentWindow.console;
-    rawToDataURL = ifr.contentWindow.HTMLCanvasElement.prototype.toDataURL;
+    rawToBlob = ifr.contentWindow.HTMLCanvasElement.prototype.toBlob;
     cleanURL = ifr.contentWindow.URL;
     rawCreateObjectURL = cleanURL.createObjectURL;
     rawRevokeObjectURL = cleanURL.revokeObjectURL;
@@ -152,7 +152,7 @@ async function runBiliMangaGrabber() {
     try { CC.debug = noop; } catch (_) {}
     try { console.clear = noop; } catch (_) {}
     try { console.debug = noop; } catch (_) {}
-    CC.log('[manga] console + toDataURL + Blob URL restored, clear/debug muted');
+    CC.log('[manga] console + toBlob + Blob URL restored, clear/debug muted');
   } catch (e) {
     console.log('iframe restore failed', e);
   }
@@ -358,16 +358,28 @@ async function runBiliMangaGrabber() {
     return all.sort((a, b) => b.width * b.height - a.width * a.height)[0] || null;
   }
 
-  // 末尾 600 字符 + 总长度作为轻量哈希
-  const sigOf = (url) => url.length + ':' + url.slice(-600);
+  // 末尾 600 字节 + 总长度作为轻量哈希，避免为去重再制造整页字符串
+  const sigOfBytes = (buffer) => {
+    const bytes = new Uint8Array(buffer);
+    const start = Math.max(0, bytes.length - 600);
+    let hash = 2166136261;
+    for (let i = start; i < bytes.length; i++) {
+      hash ^= bytes[i];
+      hash = Math.imul(hash, 16777619) >>> 0;
+    }
+    return bytes.length + ':' + hash.toString(16);
+  };
 
-  const captureCanvas = () => {
+  const captureCanvasBytes = async () => {
     const c = getCurrentCanvas();
     if (!c) return null;
     try {
-      return rawToDataURL.call(c, 'image/png');
+      const blob = await new Promise((resolve) => rawToBlob.call(c, resolve, 'image/png'));
+      if (!blob || blob.size < 1000) return null;
+      const bytes = await blob.arrayBuffer();
+      return { bytes, sig: sigOfBytes(bytes), size: blob.size };
     } catch (e) {
-      warn('toDataURL failed: ' + e.message);
+      warn('toBlob failed: ' + e.message);
       return null;
     }
   };
@@ -383,7 +395,7 @@ async function runBiliMangaGrabber() {
   // 等待新页面渲染完成：
   //   1) sig 必须与 prevSig 不同（说明翻到了新页）
   //   2) 新 sig 必须连续 stableMs 毫秒不变（说明 WASM 解密+渲染已完成，不再有 loading/过渡帧）
-  // 返回 { url, sig }、{ crossedEp } 或 null（超时）
+  // 返回 { bytes, sig, size }、{ crossedEp } 或 null（超时）
   const waitForNewStablePage = async (prevSig, maxMs, stableMs, expectedEp) => {
     const start = Date.now();
     let currentSig = null;
@@ -394,9 +406,9 @@ async function runBiliMangaGrabber() {
       if (expectedEp && currentEp !== expectedEp) {
         return { crossedEp: currentEp };
       }
-      const url = captureCanvas();
-      if (!url || url.length < 1000) continue;
-      const sig = sigOf(url);
+      const capture = await captureCanvasBytes();
+      if (!capture) continue;
+      const sig = capture.sig;
       if (sig === prevSig) {
         // 仍是上一页，等翻页生效
         currentSig = null; stableSince = 0;
@@ -404,7 +416,7 @@ async function runBiliMangaGrabber() {
       }
       if (sig === currentSig) {
         // 连续两次采样一致，累积稳定时长
-        if (Date.now() - stableSince >= stableMs) return { url, sig };
+        if (Date.now() - stableSince >= stableMs) return capture;
       } else {
         // 首次看到这个新 sig（或与上次采样不同，可能是过渡帧）
         currentSig = sig;
@@ -486,8 +498,7 @@ async function runBiliMangaGrabber() {
           navigationMismatch: true,
         };
       }
-      const url = captureCanvas();
-      if (url && url.length > 1000) first = { url, sig: sigOf(url) };
+      first = await captureCanvasBytes();
     }
     if (!first) {
       err('first page never rendered for ep=' + epId);
@@ -506,10 +517,10 @@ async function runBiliMangaGrabber() {
         navigationMismatch: true,
       };
     }
-    captures.push({ b64: first.url.split(',')[1], sig: first.sig });
+    captures.push({ bytes: first.bytes, sig: first.sig });
     seenSigs.add(first.sig);
     lastSig = first.sig;
-    log('captured page 1 (' + Math.round(first.url.length / 1024) + 'KB)');
+    log('captured page 1 (' + Math.round((first.size || first.bytes.byteLength) / 1024) + 'KB)');
 
     // 翻页 + 截图
     let stallCount = 0;
@@ -541,10 +552,11 @@ async function runBiliMangaGrabber() {
           break;
         }
         seenSigs.add(next.sig);
-        captures.push({ b64: next.url.split(',')[1], sig: next.sig });
+        captures.push({ bytes: next.bytes, sig: next.sig });
         lastSig = next.sig;
         stallCount = 0;
-        log('captured page ' + captures.length + ' (' + Math.round(next.url.length / 1024) + 'KB)');
+        log('captured page ' + captures.length + ' (' +
+            Math.round((next.size || next.bytes.byteLength) / 1024) + 'KB)');
       } else {
         stallCount++;
         warn('no new stable page (stall ' + stallCount + '/3)');
@@ -610,10 +622,63 @@ async function runBiliMangaGrabber() {
     }
   }
 
+  const ZIP_CACHE_DB_NAME = 'bili-manga-grabber-zip-cache';
+  const ZIP_CACHE_STORE = 'zips';
+
+  function openZipCacheDb() {
+    return new Promise((resolve, reject) => {
+      if (!window.indexedDB) {
+        reject(new Error('IndexedDB unavailable'));
+        return;
+      }
+      const request = indexedDB.open(ZIP_CACHE_DB_NAME, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(ZIP_CACHE_STORE)) {
+          db.createObjectStore(ZIP_CACHE_STORE, { keyPath: 'key' });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error('open IndexedDB failed'));
+    });
+  }
+
+  async function withZipCacheStore(mode, action) {
+    const db = await openZipCacheDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(ZIP_CACHE_STORE, mode);
+      const store = tx.objectStore(ZIP_CACHE_STORE);
+      const request = action(store);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error('IndexedDB request failed'));
+      tx.oncomplete = () => db.close();
+      tx.onerror = () => {
+        db.close();
+        reject(tx.error || new Error('IndexedDB transaction failed'));
+      };
+      tx.onabort = () => {
+        db.close();
+        reject(tx.error || new Error('IndexedDB transaction aborted'));
+      };
+    });
+  }
+
+  async function cacheZipBlob(record) {
+    return withZipCacheStore('readwrite', (store) => store.put(record));
+  }
+
+  async function getCachedZipBlob(key) {
+    return withZipCacheStore('readonly', (store) => store.get(key));
+  }
+
+  async function deleteCachedZipBlob(key) {
+    return withZipCacheStore('readwrite', (store) => store.delete(key));
+  }
+
   function releaseChapterPayloads(chapters) {
     chapters.forEach((ch) => {
       ch.captures.forEach((c) => {
-        c.b64 = '';
+        c.bytes = null;
         c.sig = '';
       });
       ch.captures.length = 0;
@@ -648,13 +713,6 @@ async function runBiliMangaGrabber() {
         return (crc ^ 0xffffffff) >>> 0;
       }
 
-      function decodeBase64(b64) {
-        const binary = atob(b64);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-        return bytes;
-      }
-
       function writeU16(view, offset, value) {
         view.setUint16(offset, value, true);
       }
@@ -672,7 +730,7 @@ async function runBiliMangaGrabber() {
 
         chapters.forEach((chapter) => {
           chapter.captures.forEach((capture, index) => {
-            const data = decodeBase64(capture.b64);
+            const data = new Uint8Array(capture.bytes);
             const name = chapter.folderName + '/page_' + String(index + 1).padStart(3, '0') + '.png';
             const nameBytes = textEncoder.encode(name);
             files.push({
@@ -783,14 +841,16 @@ async function runBiliMangaGrabber() {
 
   function makeZipWorkerPayload(chapters) {
     let rawBytes = 0;
+    const transferables = [];
     const payloadChapters = chapters.map((ch) => ({
       folderName: makeChapterFolderName(ch.title),
       captures: ch.captures.map((c) => {
-        rawBytes += Math.round(c.b64.length * 0.75);
-        return { b64: c.b64 };
+        rawBytes += c.bytes.byteLength;
+        transferables.push(c.bytes);
+        return { bytes: c.bytes };
       }),
     }));
-    return { chapters: payloadChapters, rawBytes };
+    return { chapters: payloadChapters, rawBytes, transferables };
   }
 
   async function createZipBlobInMainThread(chapters, onProgress) {
@@ -802,8 +862,8 @@ async function runBiliMangaGrabber() {
       const folderName = makeChapterFolderName(ch.title);
       const folder = zip.folder(folderName);
       ch.captures.forEach((c, i) => {
-        folder.file('page_' + String(i + 1).padStart(3, '0') + '.png', c.b64, { base64: true });
-        rawBytes += Math.round(c.b64.length * 0.75);
+        folder.file('page_' + String(i + 1).padStart(3, '0') + '.png', c.bytes);
+        rawBytes += c.bytes.byteLength;
         processed++;
         if (onProgress && (processed === total || processed % 20 === 0)) {
           onProgress(processed, total);
@@ -840,6 +900,7 @@ async function runBiliMangaGrabber() {
       return createZipBlobInMainThread(chapters, onProgress);
     }
     let worker = null;
+    let transferredPayload = false;
 
     try {
       worker = new Worker(workerUrl);
@@ -861,7 +922,8 @@ async function runBiliMangaGrabber() {
         worker.onerror = (event) => {
           reject(new Error(event.message || 'worker error while packing ' + batchLabel));
         };
-        worker.postMessage({ chapters: payload.chapters });
+        worker.postMessage({ chapters: payload.chapters }, payload.transferables);
+        transferredPayload = true;
       });
       return {
         blob: new Blob([result.zipArrayBuffer], { type: 'application/zip' }),
@@ -870,6 +932,9 @@ async function runBiliMangaGrabber() {
         method: 'worker',
       };
     } catch (e) {
+      if (transferredPayload) {
+        throw new Error('worker ZIP packing failed after binary transfer: ' + (e?.message || e));
+      }
       warn('fallback to main-thread ZIP packing: ' + (e?.message || e));
       return createZipBlobInMainThread(chapters, onProgress);
     } finally {
@@ -901,6 +966,28 @@ async function runBiliMangaGrabber() {
     let zipBlob = zipResult.blob;
     const zipMB = zipResult.zipMB;
     const filename = mangaName + '_' + batchLabel + '_' + chapterCount + 'eps_' + totalPages + 'p.zip';
+    const zipEntry = {
+      key: 'zip_' + Date.now() + '_' + Math.random().toString(36).slice(2),
+      filename,
+      batchLabel,
+      chapterCount,
+      totalPages,
+      zipMB,
+      size: zipBlob.size,
+      createdAt: Date.now(),
+    };
+    let cachedZip = false;
+    try {
+      await cacheZipBlob({
+        ...zipEntry,
+        blob: zipBlob,
+      });
+      zipBlob = null;
+      cachedZip = true;
+      log(batchLabel + ' cached in IndexedDB (' + zipMB + 'MB)');
+    } catch (e) {
+      warn('IndexedDB cache failed, keep in-memory ZIP: ' + (e?.message || e));
+    }
     releaseChapterPayloads(chapters);
 
     const dlBtn = document.createElement('button');
@@ -913,20 +1000,26 @@ async function runBiliMangaGrabber() {
       wordBreak: 'break-all', whiteSpace: 'pre-wrap',
     });
     const readyText = '⬇ 下载 ZIP ' + batchLabel + '\n' + filename + '\n(' +
-      chapterCount + ' 话 / ' + totalPages + ' 页 / ' + zipMB + 'MB)';
+      chapterCount + ' 话 / ' + totalPages + ' 页 / ' + zipMB + 'MB' +
+      (cachedZip ? ' / IndexedDB' : ' / memory') + ')';
     dlBtn.textContent = readyText;
     dlBtn.onclick = async function () {
-      if (!zipBlob) {
-        warn('ZIP blob already released: ' + filename);
-        return;
-      }
       dlBtn.disabled = true;
       dlBtn.textContent = '保存中...\n' + filename;
       try {
-        const method = await saveZipBlob(filename, zipBlob);
-        zipBlob = null;
-        dlBtn.textContent = '✓ 已保存(' + method + '): ' + filename;
-        dlBtn.style.background = '#444';
+        const cached = cachedZip ? await getCachedZipBlob(zipEntry.key) : null;
+        const blobForDownload = cached?.blob || zipBlob;
+        if (!blobForDownload) {
+          warn('ZIP cache missing: ' + filename);
+          dlBtn.disabled = false;
+          dlBtn.textContent = readyText;
+          return;
+        }
+        const method = await saveZipBlob(cached?.filename || filename, blobForDownload);
+        if (!cachedZip) zipBlob = null;
+        dlBtn.textContent = '✓ 已触发下载(' + method + '): ' + filename;
+        dlBtn.disabled = cachedZip ? false : true;
+        dlBtn.style.background = cachedZip ? '#087' : '#444';
       } catch (e) {
         const isAbort = e?.name === 'AbortError';
         warn((isAbort ? 'save canceled: ' : 'save failed: ') + (e?.message || e));
@@ -943,7 +1036,7 @@ async function runBiliMangaGrabber() {
 
   // ============ 7. 主循环：连续抓多话，每批打一包 ============
   const MAX_CHAPTERS = 100;
-  const batchChapters = []; // 当前未打包批次：[{epId, title, captures: [{b64, sig}]}, ...]
+  const batchChapters = []; // 当前未打包批次：[{epId, title, captures: [{bytes, sig}]}, ...]
   const doneEps = new Set();
   let completedChapterCount = 0;
   let totalCapturedPages = 0;

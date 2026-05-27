@@ -54,6 +54,34 @@ test('blob URLs use a clean iframe URL implementation', () => {
   assert.doesNotMatch(source, /URL\.createObjectURL\(zipBlob\)/);
 });
 
+test('canvas capture uses clean toBlob and binary payloads instead of base64', () => {
+  assert.match(source, /let rawToBlob = HTMLCanvasElement\.prototype\.toBlob;/);
+  assert.match(source, /rawToBlob = ifr\.contentWindow\.HTMLCanvasElement\.prototype\.toBlob;/);
+  assert.match(source, /rawToBlob\.call\(c, resolve, 'image\/png'\)/);
+  assert.match(source, /const sigOfBytes = \(buffer\) =>/);
+  assert.match(source, /captures\.push\(\{ bytes: first\.bytes, sig: first\.sig \}\)/);
+  assert.match(source, /captures\.push\(\{ bytes: next\.bytes, sig: next\.sig \}\)/);
+  assert.doesNotMatch(source, /captures\.push\(\{ b64:/);
+});
+
+test('zip blobs are cached in IndexedDB before download', () => {
+  assert.match(source, /const ZIP_CACHE_DB_NAME =/);
+  assert.match(source, /indexedDB\.open\(ZIP_CACHE_DB_NAME, 1\)/);
+  assert.match(source, /db\.createObjectStore\(ZIP_CACHE_STORE, \{ keyPath: 'key' \}\)/);
+  assert.match(source, /async function cacheZipBlob\(/);
+  assert.match(source, /async function getCachedZipBlob\(/);
+  assert.match(source, /async function deleteCachedZipBlob\(/);
+  assert.match(source, /await cacheZipBlob\(\{/);
+  assert.match(source, /zipBlob = null;/);
+  assert.match(source, /await getCachedZipBlob\(zipEntry\.key\)/);
+});
+
+test('worker payload transfers binary ArrayBuffers', () => {
+  assert.match(source, /transferables\.push\(c\.bytes\)/);
+  assert.match(source, /worker\.postMessage\(\{ chapters: payload\.chapters \}, payload\.transferables\)/);
+  assert.doesNotMatch(source, /return \{ b64: c\.b64 \}/);
+});
+
 test('worker source returned by makeZipWorkerSource is valid JavaScript', () => {
   const workerSource = getWorkerSource();
   assert.equal(workerSource.includes('Bilibili Manga Grabber'), false);
@@ -70,20 +98,19 @@ test('worker source creates a readable store zip payload', () => {
     DataView,
     String,
     Error,
-    atob: (b64) => Buffer.from(b64, 'base64').toString('binary'),
     self: {
       postMessage: (message) => messages.push(message),
     },
   };
   vm.runInNewContext(getWorkerSource(), context);
 
-  const hello = Buffer.from('hello').toString('base64');
-  const world = Buffer.from('world').toString('base64');
+  const hello = Uint8Array.from(Buffer.from('hello')).buffer;
+  const world = Uint8Array.from(Buffer.from('world')).buffer;
   context.self.onmessage({
     data: {
       chapters: [{
         folderName: '001_第1话',
-        captures: [{ b64: hello }, { b64: world }],
+        captures: [{ bytes: hello }, { bytes: world }],
       }],
     },
   });
