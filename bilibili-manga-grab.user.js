@@ -162,30 +162,87 @@ async function runBiliMangaGrabber() {
   const CW = (...a) => CC.warn('[manga]', ...a);
   const CE = (...a) => CC.error('[manga]', ...a);
 
-  // ============ 0.5 浮层日志 ============
-  const box = document.createElement('div');
-  Object.assign(box.style, {
+  // ============ 0.5 浮层日志 + 复制按钮 ============
+  const logHistory = [];
+  const logContainer = document.createElement('div');
+  Object.assign(logContainer.style, {
     position: 'fixed',
     right: '8px',
     bottom: '8px',
     width: '380px',
     maxHeight: '320px',
-    overflow: 'auto',
     background: 'rgba(0,0,0,0.85)',
-    color: '#0f0',
-    font: '12px/1.4 ui-monospace, monospace',
-    padding: '8px 10px',
     zIndex: '99999',
     borderRadius: '8px',
     boxShadow: '0 2px 10px #000',
+    display: 'flex',
+    flexDirection: 'column',
+    overflow: 'hidden',
+  });
+  logContainer.id = '__manga_log_container';
+  const logHeader = document.createElement('div');
+  Object.assign(logHeader.style, {
+    display: 'flex',
+    justifyContent: 'flex-end',
+    gap: '4px',
+    padding: '4px 8px',
+    background: 'rgba(0,0,0,0.95)',
+    borderBottom: '1px solid #333',
+    flex: '0 0 auto',
+  });
+  const copyLogBtn = document.createElement('button');
+  Object.assign(copyLogBtn.style, {
+    padding: '3px 10px',
+    background: '#06c',
+    color: '#fff',
+    border: '1px solid #fff',
+    borderRadius: '4px',
+    cursor: 'pointer',
+    font: 'bold 11px/1.2 ui-monospace, monospace',
+  });
+  copyLogBtn.textContent = '复制日志';
+  const defaultCopyLabel = '复制日志';
+  copyLogBtn.onclick = async () => {
+    const text = logHistory.join('\n');
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch (_) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        Object.assign(ta.style, { position: 'fixed', top: '-9999px', left: '-9999px' });
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+      } catch (_) {}
+    }
+    copyLogBtn.textContent = ok ? '✓ 已复制 ' + logHistory.length + ' 行' : '✗ 复制失败';
+    setTimeout(() => { copyLogBtn.textContent = defaultCopyLabel; }, 1500);
+  };
+  logHeader.appendChild(copyLogBtn);
+  const box = document.createElement('div');
+  Object.assign(box.style, {
+    overflow: 'auto',
+    color: '#0f0',
+    font: '12px/1.4 ui-monospace, monospace',
+    padding: '8px 10px',
+    flex: '1 1 auto',
+    minHeight: '0',
   });
   box.id = '__manga_log';
-  document.body.appendChild(box);
+  logContainer.appendChild(logHeader);
+  logContainer.appendChild(box);
+  document.body.appendChild(logContainer);
   const ui = (msg, color) => {
     const ts = new Date().toTimeString().slice(0, 8);
+    const line = '[' + ts + '] ' + msg;
+    logHistory.push(line);
     const div = document.createElement('div');
     div.style.color = color || '#0f0';
-    div.textContent = '[' + ts + '] ' + msg;
+    div.textContent = line;
     box.appendChild(div);
     box.scrollTop = 1e9;
   };
@@ -439,8 +496,13 @@ async function runBiliMangaGrabber() {
     let lastSig = '';
     let completed = false; // true 表示本话已自然结束（跨章/抓满/stall 3 次）；false=被 STOP 中断
 
-    // 回到本话首页（已在首页时 PgUp 会跨到上一话，立即 PgDown 回来）
+    // 回到本话首页：
+    //   - 一般情况下 PgUp 翻到上一页，到达本话第一页后再 PgUp 会跨到上一话（URL 变化），立即跳出
+    //   - 整部漫画第一话第一页：PgUp 既不会跨章也不会移动，必须靠 canvas 签名连续不变来短路退出
     log('rewind to first page of ep=' + epId);
+    const initialRewindCap = await captureCanvasBytes();
+    let lastRewindSig = initialRewindCap?.sig || '';
+    let rewindStuckCount = 0;
     let rewindCount = 0;
     for (let i = 0; i < total + 5; i++) {
       if (stopRequested) {
@@ -466,6 +528,20 @@ async function runBiliMangaGrabber() {
         break;
       }
       rewindCount++;
+      const cap = await captureCanvasBytes();
+      if (cap) {
+        if (lastRewindSig && cap.sig === lastRewindSig) {
+          rewindStuckCount++;
+          if (rewindStuckCount >= 2) {
+            log('rewind: canvas unchanged for ' + (rewindStuckCount + 1) +
+                ' PageUps (' + rewindCount + ' steps), assuming first page of manga');
+            break;
+          }
+        } else {
+          rewindStuckCount = 0;
+          lastRewindSig = cap.sig;
+        }
+      }
     }
     log('rewind done (' + rewindCount + ' steps)');
     await sleep(500);
