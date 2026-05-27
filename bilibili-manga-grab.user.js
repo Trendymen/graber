@@ -627,26 +627,34 @@ async function runBiliMangaGrabber() {
   //   pn:    从开始到 .current-page 数字翻过去（reader 真正翻页的耗时；A→B 是页号变化）
   //   sig:   翻页确认后到拿到与 prevSig 不同的 toBlob 结果（也就是 canvas 真正画完的耗时）
   //   blobs: 累计 toBlob 次数 + 总编码毫秒；prevSigSeen: pn 翻了但 canvas 还显示上一页的次数
+  //   earlySig✓: pn 还没翻的时候 canvas 就已经换页了，旁路检测命中提前返回
   const formatWaitDebug = (d) => {
     if (!d) return '';
     const pnPart = d.pnFrom !== null && d.pnTo !== null
       ? ' pn=' + d.pnFrom + '→' + d.pnTo + '@' + d.pnWaitMs + 'ms'
-      : (d.pnFrom !== null ? ' pn=?@' + d.pnWaitMs + 'ms' : '');
+      : (d.pnFrom !== null
+          ? (d.earlySigWon ? ' pn=stuck(skipped)' : ' pn=?@' + d.pnWaitMs + 'ms')
+          : '');
     return ' [total=' + d.totalMs + 'ms' + pnPart +
         ' sig=' + d.sigWaitMs + 'ms' +
         ' blobs=' + d.blobs + '@' + d.blobMs + 'ms' +
+        (d.earlySigWon ? ' earlySig✓' : '') +
         (d.prevSigSeen ? ' prevSig=' + d.prevSigSeen : '') + ']';
   };
 
   // 等待新页面渲染完成：
   //   1) 如有 prevPageNum：先轮询 .current-page 直到数字变化（DOM 读取近乎免费，不烧 toBlob）
-  //   2) 翻页后做 toBlob，sig 与 prevSig 不同即接受 —— toBlob 本身会同步到最终 paint，
-  //      实测 transients 始终为 0，无需再额外做一次 toBlob 验证稳定，从而避免慢页 ~3.8s 的重复编码
-  //   3) sig === prevSig 说明 canvas 还停在上一页，继续轮询
+  //   2) 翻页后做 toBlob，sig 与 prevSig 不同即接受 —— toBlob 本身会同步到最终 paint
+  //   3) 旁路：pn 等超过 300ms 还没翻时，开始周期性 toBlob 试探 canvas；若 sig 已经换页（reader
+  //      paint 比 DOM 异步 batch 更新更早完成），提前接受。每话末尾 N-1 那个 1.2s 尖峰里
+  //      pn 飚到 500-1300ms，旁路有机会大幅缩短。典型快页 pn 80ms 就翻，根本不会启动旁路。
+  //   4) sig === prevSig 说明 canvas 还停在上一页，继续轮询
   // 返回 { bytes, sig, size, debug }、{ crossedEp } 或 null（超时）
   const waitForNewStablePage = async (prevSig, maxMs, _stableMs, expectedEp, prevPageNum) => {
     const start = Date.now();
     const hasPageNum = typeof prevPageNum === 'number';
+    const EARLY_SIG_AFTER_MS = 300;
+    const EARLY_SIG_INTERVAL_MS = 240;
     let pageNumChanged = false;
     let pageNumChangedAt = 0;
     let pageNumAfter = null;
@@ -655,6 +663,22 @@ async function runBiliMangaGrabber() {
     let numCaptures = 0;
     let pageNumPolls = 0;
     let prevSigSeen = 0;
+    let earlySigWon = false;
+    let nextEarlySigAt = start + EARLY_SIG_AFTER_MS;
+
+    const makeDebug = () => ({
+      totalMs: Date.now() - start,
+      pnWaitMs: pageNumChangedAt ? pageNumChangedAt - start : 0,
+      sigWaitMs: pageNumChangedAt ? Date.now() - pageNumChangedAt : Date.now() - start,
+      pnPolls: pageNumPolls,
+      pnFrom: hasPageNum ? prevPageNum : null,
+      pnTo: pageNumAfter,
+      blobs: numCaptures,
+      blobMs: toBlobMs,
+      prevSigSeen,
+      earlySigWon,
+    });
+
     while (Date.now() - start < maxMs) {
       await sleep(80);
       const currentEp = getEpFromUrl();
@@ -669,7 +693,23 @@ async function runBiliMangaGrabber() {
           if (++nullPageNumStreak < 5) continue;
           // 指示器丢失，落回到纯 sig 检测
         } else if (num === prevPageNum) {
-          continue;  // 还停在上一页
+          // pn 还没翻；超过 EARLY_SIG_AFTER_MS 后开始 sig 旁路
+          if (hasPageNum && Date.now() >= nextEarlySigAt) {
+            nextEarlySigAt = Date.now() + EARLY_SIG_INTERVAL_MS;
+            const blobStart = Date.now();
+            const capture = await captureCanvasBytes();
+            toBlobMs += Date.now() - blobStart;
+            numCaptures++;
+            if (capture) {
+              if (capture.sig !== prevSig) {
+                earlySigWon = true;
+                capture.debug = makeDebug();
+                return capture;
+              }
+              prevSigSeen++;
+            }
+          }
+          continue;
         } else {
           pageNumChanged = true;
           pageNumChangedAt = Date.now();
@@ -685,17 +725,7 @@ async function runBiliMangaGrabber() {
         prevSigSeen++;
         continue;
       }
-      capture.debug = {
-        totalMs: Date.now() - start,
-        pnWaitMs: pageNumChangedAt ? pageNumChangedAt - start : 0,
-        sigWaitMs: pageNumChangedAt ? Date.now() - pageNumChangedAt : Date.now() - start,
-        pnPolls: pageNumPolls,
-        pnFrom: hasPageNum ? prevPageNum : null,
-        pnTo: pageNumAfter,
-        blobs: numCaptures,
-        blobMs: toBlobMs,
-        prevSigSeen,
-      };
+      capture.debug = makeDebug();
       return capture;
     }
     return null;
