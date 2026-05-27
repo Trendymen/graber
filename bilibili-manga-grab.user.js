@@ -525,36 +525,33 @@ async function runBiliMangaGrabber() {
 
   // 把 waitForNewStablePage 的内部计时拼成单行日志后缀
   //   total: 从 PageDown 到截图返回的全程
-  //   pn:  从开始到 .current-page 数字翻过去（reader 真正翻页的耗时；A→B 是页号变化）
-  //   sig: 翻页确认后到 canvas sig 稳定的耗时（WASM 渲染 + 等过渡帧收敛）
-  //   blobs: 累计 toBlob 次数 + 总编码毫秒；transients: 翻页后看到的不同过渡 sig 数
+  //   pn:    从开始到 .current-page 数字翻过去（reader 真正翻页的耗时；A→B 是页号变化）
+  //   sig:   翻页确认后到拿到与 prevSig 不同的 toBlob 结果（也就是 canvas 真正画完的耗时）
+  //   blobs: 累计 toBlob 次数 + 总编码毫秒；prevSigSeen: pn 翻了但 canvas 还显示上一页的次数
   const formatWaitDebug = (d) => {
     if (!d) return '';
     const pnPart = d.pnFrom !== null && d.pnTo !== null
       ? ' pn=' + d.pnFrom + '→' + d.pnTo + '@' + d.pnWaitMs + 'ms'
       : (d.pnFrom !== null ? ' pn=?@' + d.pnWaitMs + 'ms' : '');
     return ' [total=' + d.totalMs + 'ms' + pnPart +
-        ' sig=' + d.sigWaitMs + 'ms(stab=' + d.requiredStableMs + ')' +
+        ' sig=' + d.sigWaitMs + 'ms' +
         ' blobs=' + d.blobs + '@' + d.blobMs + 'ms' +
-        ' transients=' + d.transients +
         (d.prevSigSeen ? ' prevSig=' + d.prevSigSeen : '') + ']';
   };
 
   // 等待新页面渲染完成：
   //   1) 如有 prevPageNum：先轮询 .current-page 直到数字变化（DOM 读取近乎免费，不烧 toBlob）
-  //   2) sig 必须与 prevSig 不同（说明翻到了新页）
-  //   3) 新 sig 必须连续 stableMs 毫秒不变（页号已经确认翻页时窗口缩短到 200ms）
+  //   2) 翻页后做 toBlob，sig 与 prevSig 不同即接受 —— toBlob 本身会同步到最终 paint，
+  //      实测 transients 始终为 0，无需再额外做一次 toBlob 验证稳定，从而避免慢页 ~3.8s 的重复编码
+  //   3) sig === prevSig 说明 canvas 还停在上一页，继续轮询
   // 返回 { bytes, sig, size, debug }、{ crossedEp } 或 null（超时）
-  const waitForNewStablePage = async (prevSig, maxMs, stableMs, expectedEp, prevPageNum) => {
+  const waitForNewStablePage = async (prevSig, maxMs, _stableMs, expectedEp, prevPageNum) => {
     const start = Date.now();
     const hasPageNum = typeof prevPageNum === 'number';
     let pageNumChanged = false;
     let pageNumChangedAt = 0;
     let pageNumAfter = null;
     let nullPageNumStreak = 0;
-    let currentSig = null;
-    let stableSince = 0;
-    let transientSigs = 0;
     let toBlobMs = 0;
     let numCaptures = 0;
     let pageNumPolls = 0;
@@ -585,35 +582,22 @@ async function runBiliMangaGrabber() {
       toBlobMs += Date.now() - blobStart;
       numCaptures++;
       if (!capture) continue;
-      const sig = capture.sig;
-      if (sig === prevSig) {
+      if (capture.sig === prevSig) {
         prevSigSeen++;
-        currentSig = null; stableSince = 0;
         continue;
       }
-      const requiredStable = pageNumChanged ? Math.min(200, stableMs) : stableMs;
-      if (sig === currentSig) {
-        if (Date.now() - stableSince >= requiredStable) {
-          capture.debug = {
-            totalMs: Date.now() - start,
-            pnWaitMs: pageNumChangedAt ? pageNumChangedAt - start : 0,
-            sigWaitMs: pageNumChangedAt ? Date.now() - pageNumChangedAt : Date.now() - start,
-            pnPolls: pageNumPolls,
-            pnFrom: hasPageNum ? prevPageNum : null,
-            pnTo: pageNumAfter,
-            blobs: numCaptures,
-            blobMs: toBlobMs,
-            transients: transientSigs,
-            prevSigSeen,
-            requiredStableMs: requiredStable,
-          };
-          return capture;
-        }
-      } else {
-        if (currentSig !== null) transientSigs++;
-        currentSig = sig;
-        stableSince = Date.now();
-      }
+      capture.debug = {
+        totalMs: Date.now() - start,
+        pnWaitMs: pageNumChangedAt ? pageNumChangedAt - start : 0,
+        sigWaitMs: pageNumChangedAt ? Date.now() - pageNumChangedAt : Date.now() - start,
+        pnPolls: pageNumPolls,
+        pnFrom: hasPageNum ? prevPageNum : null,
+        pnTo: pageNumAfter,
+        blobs: numCaptures,
+        blobMs: toBlobMs,
+        prevSigSeen,
+      };
+      return capture;
     }
     return null;
   };
