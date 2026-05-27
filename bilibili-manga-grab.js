@@ -172,7 +172,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const RATE_LIMIT = {
-    pageRestMs: [500, 1200],
+    pageRestMs: [0, 0],
     chapterRestMs: [3000, 5000],
   };
   const MAX_CHAPTER_RETRIES = 3;
@@ -180,6 +180,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   const randomMs = ([min, max]) => Math.floor(min + Math.random() * (max - min + 1));
   const rest = async (label, range) => {
     const ms = randomMs(range);
+    if (ms <= 0) return !stopRequested;
     log(label + '，休息 ' + (ms / 1000).toFixed(1) + 's');
     const endAt = Date.now() + ms;
     while (!stopRequested && Date.now() < endAt) {
