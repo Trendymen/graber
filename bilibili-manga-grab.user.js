@@ -403,10 +403,13 @@ async function runBiliMangaGrabber() {
     const m = text.match(/(\d+)\s*P\b/i);
     return m ? Number(m[1]) : null;
   };
-  // 优先在 info-hud 内查找页码（精确路径来自实测 DOM：.info-hud .hinter-image-container span）
+  // 优先在 info-hud 内查找页码（精确语义类：.current-page；深路径作为兜底）
   // 容错：若节点内只有单个数字（仅 current），则与 body 文本里的 'NP' 总数拼出完整信息
   const getDisplayedPageInfo = () => {
     const containers = [
+      '.current-page',
+      'span.current-page',
+      '.info-hud .current-page',
       '.reader-layout .info-layer .info-hud .hinter-image-container span',
       '.info-hud .hinter-image-container span',
       '.hinter-image-container span',
