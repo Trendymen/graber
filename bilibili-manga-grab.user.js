@@ -121,6 +121,7 @@ async function runBiliMangaGrabber() {
     return;
   }
   window.__biliMangaGrabberRunning = true;
+  let audioKeepAlive = null;
   try {
   try {
     if (!window.JSZip && typeof JSZip !== 'undefined') window.JSZip = JSZip;
@@ -272,6 +273,32 @@ async function runBiliMangaGrabber() {
       (RATE_LIMIT.pageRestMs[1] / 1000).toFixed(1) + 's, chapters ' +
       (RATE_LIMIT.chapterRestMs[0] / 1000).toFixed(1) + '-' +
       (RATE_LIMIT.chapterRestMs[1] / 1000).toFixed(1) + 's');
+
+  // ============ 0.7 防节流：静音 AudioContext keep-alive ============
+  // Edge 的"睡眠标签页 / 效率模式"和 Chrome 的后台节流，对前台但没有最近用户输入的 tab
+  // 也会降级 canvas paint / WASM 解码优先级，造成 toBlob 偶发 3-4s 卡顿。
+  // 合成 mousemove 因 isTrusted=false 被忽略；播放静音音频是公认能让 tab 保持 "active" 的方式。
+  // START 按钮的 click 已经提供了恢复 AudioContext 所需的 user gesture。
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) {
+      audioKeepAlive = new AC();
+      const osc = audioKeepAlive.createOscillator();
+      const gain = audioKeepAlive.createGain();
+      gain.gain.value = 0;
+      osc.connect(gain).connect(audioKeepAlive.destination);
+      osc.start();
+      if (audioKeepAlive.state === 'suspended') {
+        audioKeepAlive.resume().catch(() => {});
+      }
+      log('audio keep-alive active (state=' + audioKeepAlive.state + ')');
+    } else {
+      warn('AudioContext unavailable, tab throttling may slow captures');
+    }
+  } catch (e) {
+    warn('audio keep-alive setup failed: ' + (e?.message || e));
+    audioKeepAlive = null;
+  }
 
   // ============ 1. 加载 JSZip ============
   if (!window.JSZip) {
@@ -1358,6 +1385,7 @@ async function runBiliMangaGrabber() {
   log('ZIP ready — 点右上角绿色按钮下载各批次');
   } finally {
     window.__biliMangaGrabberRunning = false;
+    try { if (audioKeepAlive) audioKeepAlive.close(); } catch (_) {}
   }
 }
 
