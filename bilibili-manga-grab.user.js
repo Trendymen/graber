@@ -1349,20 +1349,33 @@ async function runBiliMangaGrabber() {
       continue;
     }
 
-    // 推进到下一话
+    // 推进到下一话：每次按 PgDown 后自适应轮询 URL，单次最多 3s；
+    // URL 变化后再轮询 .current-page 直到显示 page 1（最多 2s），相比原先固定 800ms+1500ms 显著更快
     log('advancing to next chapter...');
+    const advanceStart = Date.now();
     const epBefore = getEpFromUrl();
     let advanced = false;
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 5 && !advanced; i++) {
       press('PageDown');
-      await sleep(800);
-      if (getEpFromUrl() !== epBefore) { advanced = true; break; }
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        await sleep(80);
+        if (getEpFromUrl() !== epBefore) { advanced = true; break; }
+      }
     }
     if (!advanced) {
       log('could not advance past ep=' + epBefore + ', end of manga');
       break;
     }
-    await sleep(1500); // 新话给 reader 加载缓冲
+    const epAdvancedAt = Date.now();
+    const readyDeadline = Date.now() + 2000;
+    while (Date.now() < readyDeadline) {
+      await sleep(80);
+      if (getCurrentPageNumberFast() === 1) break;
+    }
+    log('advanced ep=' + epBefore + '→' + getEpFromUrl() +
+        ' in ' + (epAdvancedAt - advanceStart) + 'ms, reader ready in ' +
+        (Date.now() - epAdvancedAt) + 'ms');
   }
 
   // ============ 8. 收尾：不足一批时生成尾包 ============
