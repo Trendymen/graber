@@ -451,6 +451,17 @@ async function runBiliMangaGrabber() {
     if (info) return info.total;
     return getTotalFromBodyText();
   };
+  // Fast 路径：仅取 .current-page 的纯数字 textContent，O(1)，可在轮询循环里安全调用。
+  // 与 getDisplayedPageInfo 不同的是：不读 total（不触发 document.body.innerText 这种 layout-aware 扫描）
+  const getCurrentPageNumberFast = () => {
+    try {
+      const el = document.querySelector('.current-page');
+      if (!el) return null;
+      const t = (el.textContent || '').trim();
+      const m = t.match(/^(\d+)$/);
+      return m ? Number(m[1]) : null;
+    } catch (_) { return null; }
+  };
   const returnToEp = async (epId, preferredKey) => {
     if (getEpFromUrl() === epId) return true;
     warn('returning to ep=' + epId + ' for retry...');
@@ -513,32 +524,46 @@ async function runBiliMangaGrabber() {
   };
 
   // 等待新页面渲染完成：
-  //   1) sig 必须与 prevSig 不同（说明翻到了新页）
-  //   2) 新 sig 必须连续 stableMs 毫秒不变（说明 WASM 解密+渲染已完成，不再有 loading/过渡帧）
+  //   1) 如有 prevPageNum：先轮询 .current-page 直到数字变化（DOM 读取近乎免费，不烧 toBlob）
+  //   2) sig 必须与 prevSig 不同（说明翻到了新页）
+  //   3) 新 sig 必须连续 stableMs 毫秒不变（页号已经确认翻页时窗口缩短到 200ms）
   // 返回 { bytes, sig, size }、{ crossedEp } 或 null（超时）
-  const waitForNewStablePage = async (prevSig, maxMs, stableMs, expectedEp) => {
+  const waitForNewStablePage = async (prevSig, maxMs, stableMs, expectedEp, prevPageNum) => {
     const start = Date.now();
+    const hasPageNum = typeof prevPageNum === 'number';
+    let pageNumChanged = false;
+    let nullPageNumStreak = 0;
     let currentSig = null;
     let stableSince = 0;
     while (Date.now() - start < maxMs) {
-      await sleep(120);
+      await sleep(80);
       const currentEp = getEpFromUrl();
       if (expectedEp && currentEp !== expectedEp) {
         return { crossedEp: currentEp };
+      }
+      // 廉价信号：reader 没把页号翻过去之前，跳过昂贵的 toBlob
+      if (hasPageNum && !pageNumChanged) {
+        const num = getCurrentPageNumberFast();
+        if (num === null) {
+          if (++nullPageNumStreak < 5) continue;
+          // 指示器丢失，落回到纯 sig 检测
+        } else if (num === prevPageNum) {
+          continue;  // 还停在上一页
+        } else {
+          pageNumChanged = true;
+        }
       }
       const capture = await captureCanvasBytes();
       if (!capture) continue;
       const sig = capture.sig;
       if (sig === prevSig) {
-        // 仍是上一页，等翻页生效
         currentSig = null; stableSince = 0;
         continue;
       }
+      const requiredStable = pageNumChanged ? Math.min(200, stableMs) : stableMs;
       if (sig === currentSig) {
-        // 连续两次采样一致，累积稳定时长
-        if (Date.now() - stableSince >= stableMs) return capture;
+        if (Date.now() - stableSince >= requiredStable) return capture;
       } else {
-        // 首次看到这个新 sig（或与上次采样不同，可能是过渡帧）
         currentSig = sig;
         stableSince = Date.now();
       }
@@ -560,18 +585,55 @@ async function runBiliMangaGrabber() {
     let completed = false; // true 表示本话已自然结束（跨章/抓满/stall 3 次）；false=被 STOP 中断
 
     // 回到本话首页：
-    //   - 优先读取 reader UI 上的 "current/total" 页码指示器；已在 page 1 直接跳过 rewind
-    //   - 否则 PgUp 翻页：到达本话第一页后再 PgUp 会跨到上一话（URL 变化），立即跳出
-    //   - 整部漫画第一话第一页 PgUp 既不跨章也不移动，再用 canvas 签名连续不变作为兜底
+    //   - 主路径：用 .current-page 数字指示器，按一次 PgUp 自适应等它递减，再按下一次（避免 reader 排队累积）
+    //   - 已在 page 1：直接跳过
+    //   - 指示器不可用：兜底回到 sig-based 翻页 + 跨章 URL / canvas 签名连续不变检测
     log('rewind to first page of ep=' + epId);
     let rewindCount = 0;
-    const initialPageInfo = getDisplayedPageInfo();
-    if (initialPageInfo && initialPageInfo.current === 1) {
-      log('already at page 1/' + initialPageInfo.total + ' of ep=' + epId + ', skip rewind');
-    } else {
-      if (initialPageInfo) {
-        log('current page indicator ' + initialPageInfo.current + '/' + initialPageInfo.total + ', rewinding');
+    let initialCurrent = getCurrentPageNumberFast();
+    if (initialCurrent === 1) {
+      log('already at page 1 of ep=' + epId + ', skip rewind');
+    } else if (initialCurrent !== null) {
+      log('current page indicator ' + initialCurrent + (displayedTotal ? '/' + displayedTotal : '') + ', rewinding');
+      let currentNum = initialCurrent;
+      const FLIP_TIMEOUT_MS = 5000;
+      while (currentNum > 1) {
+        if (stopRequested) {
+          return { epId, title, expectedPages: displayedTotal, captures, completed: false, endedOnEp: getEpFromUrl() };
+        }
+        const before = getEpFromUrl();
+        press('PageUp');
+        const deadline = Date.now() + FLIP_TIMEOUT_MS;
+        let crossed = false;
+        let newNum = currentNum;
+        while (Date.now() < deadline) {
+          await sleep(60);
+          const after = getEpFromUrl();
+          if (after !== before) { crossed = true; break; }
+          const n = getCurrentPageNumberFast();
+          if (n !== null && n !== currentNum) { newNum = n; break; }
+        }
+        if (crossed) {
+          log('rewind crossed to prev ep=' + getEpFromUrl() + ', stepping forward back to ep=' + epId);
+          if (!(await returnToEp(epId, 'PageDown'))) {
+            return {
+              epId, title, expectedPages: displayedTotal, captures, completed: false,
+              endedOnEp: getEpFromUrl(), navigationMismatch: true,
+            };
+          }
+          break;
+        }
+        rewindCount++;
+        if (newNum === currentNum) {
+          warn('rewind: PageUp had no effect within ' + (FLIP_TIMEOUT_MS / 1000) + 's at page ' + currentNum + ', giving up');
+          break;
+        }
+        currentNum = newNum;
       }
+      if (currentNum === 1) log('reached page 1 after ' + rewindCount + ' PageUps');
+    } else {
+      // .current-page 不可用：用旧的 sig-based 兜底
+      warn('page indicator unavailable, falling back to sig-based rewind');
       const initialRewindCap = await captureCanvasBytes();
       let lastRewindSig = initialRewindCap?.sig || '';
       let rewindStuckCount = 0;
@@ -587,24 +649,13 @@ async function runBiliMangaGrabber() {
           log('rewind crossed to prev ep=' + after + ', stepping forward back to ep=' + epId);
           if (!(await returnToEp(epId, 'PageDown'))) {
             return {
-              epId,
-              title,
-              expectedPages: displayedTotal,
-              captures,
-              completed: false,
-              endedOnEp: getEpFromUrl(),
-              navigationMismatch: true,
+              epId, title, expectedPages: displayedTotal, captures, completed: false,
+              endedOnEp: getEpFromUrl(), navigationMismatch: true,
             };
           }
           break;
         }
         rewindCount++;
-        // 翻页后再读一次指示器，到达 page 1 即跳出（比抓 canvas 便宜）
-        const stepInfo = getDisplayedPageInfo();
-        if (stepInfo && stepInfo.current === 1) {
-          log('reached page 1/' + stepInfo.total + ' after ' + rewindCount + ' PageUps');
-          break;
-        }
         const cap = await captureCanvasBytes();
         if (cap) {
           if (lastRewindSig && cap.sig === lastRewindSig) {
@@ -682,8 +733,9 @@ async function runBiliMangaGrabber() {
     for (let i = 1; i < MAX_ITER; i++) {
       if (stopRequested) break; // completed 保持 false → 整话被丢弃
       if (!(await rest('页间节流', RATE_LIMIT.pageRestMs))) break;
+      const prevPageNum = getCurrentPageNumberFast();
       press('PageDown');
-      const next = await waitForNewStablePage(lastSig, 8000, 500, epId);
+      const next = await waitForNewStablePage(lastSig, 8000, 500, epId, prevPageNum);
 
       if (next?.crossedEp) {
         log('crossed to next ep (' + next.crossedEp + '), end of ' + epId);
