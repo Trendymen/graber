@@ -125,9 +125,12 @@ async function runBiliMangaGrabber() {
   try {
     if (!window.JSZip && typeof JSZip !== 'undefined') window.JSZip = JSZip;
   } catch (_) {}
-  // ============ 0. 从隐藏 iframe 拿干净的 console + toDataURL ============
+  // ============ 0. 从隐藏 iframe 拿干净的 console + toDataURL + Blob URL ============
   let CC = console;
   let rawToDataURL = HTMLCanvasElement.prototype.toDataURL;
+  let cleanURL = URL;
+  let rawCreateObjectURL = URL.createObjectURL;
+  let rawRevokeObjectURL = URL.revokeObjectURL;
   try {
     const ifr = document.createElement('iframe');
     Object.assign(ifr.style, {
@@ -138,6 +141,9 @@ async function runBiliMangaGrabber() {
     document.documentElement.appendChild(ifr);
     CC = ifr.contentWindow.console;
     rawToDataURL = ifr.contentWindow.HTMLCanvasElement.prototype.toDataURL;
+    cleanURL = ifr.contentWindow.URL;
+    rawCreateObjectURL = cleanURL.createObjectURL;
+    rawRevokeObjectURL = cleanURL.revokeObjectURL;
     window.__cleanConsoleIframe = ifr;
     try { window.console = CC; } catch (_) {}
     try { Object.defineProperty(window, 'console', { value: CC, configurable: true, writable: true }); } catch (_) {}
@@ -146,10 +152,12 @@ async function runBiliMangaGrabber() {
     try { CC.debug = noop; } catch (_) {}
     try { console.clear = noop; } catch (_) {}
     try { console.debug = noop; } catch (_) {}
-    CC.log('[manga] console + toDataURL restored, clear/debug muted');
+    CC.log('[manga] console + toDataURL + Blob URL restored, clear/debug muted');
   } catch (e) {
     console.log('iframe restore failed', e);
   }
+  const createObjectURL = (blob) => rawCreateObjectURL.call(cleanURL, blob);
+  const revokeObjectURL = (url) => rawRevokeObjectURL.call(cleanURL, url);
   const CL = (...a) => CC.log('[manga]', ...a);
   const CW = (...a) => CC.warn('[manga]', ...a);
   const CE = (...a) => CC.error('[manga]', ...a);
@@ -586,21 +594,7 @@ async function runBiliMangaGrabber() {
 
   // ============ 6. 分批打包：每批生成一个不覆盖旧按钮的 ZIP ============
   async function saveZipBlob(filename, zipBlob) {
-    if (window.showSaveFilePicker) {
-      const handle = await window.showSaveFilePicker({
-        suggestedName: filename,
-        types: [{
-          description: 'ZIP archive',
-          accept: { 'application/zip': ['.zip'] },
-        }],
-      });
-      const writable = await handle.createWritable();
-      await writable.write(zipBlob);
-      await writable.close();
-      return 'file-picker';
-    }
-
-    const blobUrl = URL.createObjectURL(zipBlob);
+    const blobUrl = createObjectURL(zipBlob);
     try {
       const a = document.createElement('a');
       a.href = blobUrl;
@@ -612,7 +606,7 @@ async function runBiliMangaGrabber() {
       document.body.removeChild(a);
       return 'blob-url';
     } finally {
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+      setTimeout(() => revokeObjectURL(blobUrl), 60000);
     }
   }
 
@@ -627,6 +621,263 @@ async function runBiliMangaGrabber() {
     chapters.length = 0;
   }
 
+  function makeZipWorkerSource() {
+    return `
+      const textEncoder = new TextEncoder();
+      let crcTable = null;
+
+      function getCrcTable() {
+        if (crcTable) return crcTable;
+        crcTable = new Uint32Array(256);
+        for (let n = 0; n < 256; n++) {
+          let c = n;
+          for (let k = 0; k < 8; k++) {
+            c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+          }
+          crcTable[n] = c >>> 0;
+        }
+        return crcTable;
+      }
+
+      function crc32(bytes) {
+        const table = getCrcTable();
+        let crc = 0xffffffff;
+        for (let i = 0; i < bytes.length; i++) {
+          crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+        }
+        return (crc ^ 0xffffffff) >>> 0;
+      }
+
+      function decodeBase64(b64) {
+        const binary = atob(b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+      }
+
+      function writeU16(view, offset, value) {
+        view.setUint16(offset, value, true);
+      }
+
+      function writeU32(view, offset, value) {
+        view.setUint32(offset, value >>> 0, true);
+      }
+
+      function makeStoredZip(chapters) {
+        const files = [];
+        let rawBytes = 0;
+        let totalFiles = 0;
+        chapters.forEach((chapter) => { totalFiles += chapter.captures.length; });
+        let processed = 0;
+
+        chapters.forEach((chapter) => {
+          chapter.captures.forEach((capture, index) => {
+            const data = decodeBase64(capture.b64);
+            const name = chapter.folderName + '/page_' + String(index + 1).padStart(3, '0') + '.png';
+            const nameBytes = textEncoder.encode(name);
+            files.push({
+              nameBytes,
+              data,
+              crc: crc32(data),
+              localOffset: 0,
+            });
+            rawBytes += data.length;
+            processed++;
+            if (processed === totalFiles || processed % 20 === 0) {
+              self.postMessage({ type: 'progress', processed, total: totalFiles });
+            }
+          });
+        });
+
+        let localSize = 0;
+        files.forEach((file) => {
+          file.localOffset = localSize;
+          localSize += 30 + file.nameBytes.length + file.data.length;
+        });
+        let centralSize = 0;
+        files.forEach((file) => {
+          centralSize += 46 + file.nameBytes.length;
+        });
+
+        const zipArrayBuffer = new ArrayBuffer(localSize + centralSize + 22);
+        const bytes = new Uint8Array(zipArrayBuffer);
+        const view = new DataView(zipArrayBuffer);
+        let offset = 0;
+        const utf8Flag = 0x0800;
+        const storeMethod = 0;
+        const dosTime = 0;
+        const dosDate = 33;
+
+        files.forEach((file) => {
+          writeU32(view, offset, 0x04034b50); offset += 4;
+          writeU16(view, offset, 20); offset += 2;
+          writeU16(view, offset, utf8Flag); offset += 2;
+          writeU16(view, offset, storeMethod); offset += 2;
+          writeU16(view, offset, dosTime); offset += 2;
+          writeU16(view, offset, dosDate); offset += 2;
+          writeU32(view, offset, file.crc); offset += 4;
+          writeU32(view, offset, file.data.length); offset += 4;
+          writeU32(view, offset, file.data.length); offset += 4;
+          writeU16(view, offset, file.nameBytes.length); offset += 2;
+          writeU16(view, offset, 0); offset += 2;
+          bytes.set(file.nameBytes, offset); offset += file.nameBytes.length;
+          bytes.set(file.data, offset); offset += file.data.length;
+        });
+
+        const centralOffset = offset;
+        files.forEach((file) => {
+          writeU32(view, offset, 0x02014b50); offset += 4;
+          writeU16(view, offset, 20); offset += 2;
+          writeU16(view, offset, 20); offset += 2;
+          writeU16(view, offset, utf8Flag); offset += 2;
+          writeU16(view, offset, storeMethod); offset += 2;
+          writeU16(view, offset, dosTime); offset += 2;
+          writeU16(view, offset, dosDate); offset += 2;
+          writeU32(view, offset, file.crc); offset += 4;
+          writeU32(view, offset, file.data.length); offset += 4;
+          writeU32(view, offset, file.data.length); offset += 4;
+          writeU16(view, offset, file.nameBytes.length); offset += 2;
+          writeU16(view, offset, 0); offset += 2;
+          writeU16(view, offset, 0); offset += 2;
+          writeU16(view, offset, 0); offset += 2;
+          writeU16(view, offset, 0); offset += 2;
+          writeU32(view, offset, 0); offset += 4;
+          writeU32(view, offset, file.localOffset); offset += 4;
+          bytes.set(file.nameBytes, offset); offset += file.nameBytes.length;
+        });
+
+        const centralDirectorySize = offset - centralOffset;
+        writeU32(view, offset, 0x06054b50); offset += 4;
+        writeU16(view, offset, 0); offset += 2;
+        writeU16(view, offset, 0); offset += 2;
+        writeU16(view, offset, files.length); offset += 2;
+        writeU16(view, offset, files.length); offset += 2;
+        writeU32(view, offset, centralDirectorySize); offset += 4;
+        writeU32(view, offset, centralOffset); offset += 4;
+        writeU16(view, offset, 0); offset += 2;
+
+        return { zipArrayBuffer, rawBytes };
+      }
+
+      self.onmessage = (event) => {
+        try {
+          const { chapters } = event.data;
+          const { zipArrayBuffer, rawBytes } = makeStoredZip(chapters);
+          const result = {
+            type: 'done',
+            zipArrayBuffer,
+            rawBytes,
+            size: zipArrayBuffer.byteLength,
+          };
+          self.postMessage(result, [zipArrayBuffer]);
+        } catch (error) {
+          self.postMessage({
+            type: 'error',
+            message: error && error.message ? error.message : String(error),
+            stack: error && error.stack ? error.stack : '',
+          });
+        }
+      };
+    `;
+  }
+
+  function makeZipWorkerPayload(chapters) {
+    let rawBytes = 0;
+    const payloadChapters = chapters.map((ch) => ({
+      folderName: makeChapterFolderName(ch.title),
+      captures: ch.captures.map((c) => {
+        rawBytes += Math.round(c.b64.length * 0.75);
+        return { b64: c.b64 };
+      }),
+    }));
+    return { chapters: payloadChapters, rawBytes };
+  }
+
+  async function createZipBlobInMainThread(chapters, onProgress) {
+    const zip = new JSZip();
+    let rawBytes = 0;
+    let processed = 0;
+    const total = chapters.reduce((s, c) => s + c.captures.length, 0);
+    chapters.forEach((ch) => {
+      const folderName = makeChapterFolderName(ch.title);
+      const folder = zip.folder(folderName);
+      ch.captures.forEach((c, i) => {
+        folder.file('page_' + String(i + 1).padStart(3, '0') + '.png', c.b64, { base64: true });
+        rawBytes += Math.round(c.b64.length * 0.75);
+        processed++;
+        if (onProgress && (processed === total || processed % 20 === 0)) {
+          onProgress(processed, total);
+        }
+      });
+    });
+
+    const blob = await zip.generateAsync({
+      type: 'blob',
+      compression: 'STORE',
+      streamFiles: true,
+    }, (metadata) => {
+      if (onProgress) onProgress(Math.round((metadata.percent || 0) * total / 100), total);
+    });
+    return {
+      blob,
+      rawBytes,
+      zipMB: (blob.size / 1024 / 1024).toFixed(1),
+      method: 'main-thread',
+    };
+  }
+
+  async function createZipBlobInWorker(chapters, batchLabel, onProgress) {
+    if (!window.Worker || !window.Blob || !window.URL) {
+      warn('fallback to main-thread ZIP packing: Worker/Blob URL unavailable');
+      return createZipBlobInMainThread(chapters, onProgress);
+    }
+
+    const payload = makeZipWorkerPayload(chapters);
+    const workerBlob = new Blob([makeZipWorkerSource()], { type: 'text/javascript' });
+    const workerUrl = createObjectURL(workerBlob);
+    if (!workerUrl) {
+      warn('fallback to main-thread ZIP packing: createObjectURL returned empty URL');
+      return createZipBlobInMainThread(chapters, onProgress);
+    }
+    let worker = null;
+
+    try {
+      worker = new Worker(workerUrl);
+      const result = await new Promise((resolve, reject) => {
+        worker.onmessage = (event) => {
+          const msg = event.data || {};
+          if (msg.type === 'progress') {
+            if (onProgress) onProgress(msg.processed, msg.total);
+            return;
+          }
+          if (msg.type === 'done') {
+            resolve(msg);
+            return;
+          }
+          if (msg.type === 'error') {
+            reject(new Error((msg.message || 'worker error') + (msg.stack ? '\n' + msg.stack : '')));
+          }
+        };
+        worker.onerror = (event) => {
+          reject(new Error(event.message || 'worker error while packing ' + batchLabel));
+        };
+        worker.postMessage({ chapters: payload.chapters });
+      });
+      return {
+        blob: new Blob([result.zipArrayBuffer], { type: 'application/zip' }),
+        rawBytes: result.rawBytes || payload.rawBytes,
+        zipMB: ((result.size || result.zipArrayBuffer.byteLength) / 1024 / 1024).toFixed(1),
+        method: 'worker',
+      };
+    } catch (e) {
+      warn('fallback to main-thread ZIP packing: ' + (e?.message || e));
+      return createZipBlobInMainThread(chapters, onProgress);
+    } finally {
+      if (worker) worker.terminate();
+      revokeObjectURL(workerUrl);
+    }
+  }
+
   async function createZipDownloadButton(chapters, batchNo, startChapterNo) {
     if (!chapters.length) return null;
 
@@ -636,24 +887,19 @@ async function runBiliMangaGrabber() {
 
     log('━━━ packing ' + batchLabel + ': ' + chapterCount + ' chapters / ' + totalPages + ' pages ━━━');
 
-    const zip = new JSZip();
-    let rawBytes = 0;
-    chapters.forEach((ch) => {
-      const folderName = makeChapterFolderName(ch.title);
-      const folder = zip.folder(folderName);
-      ch.captures.forEach((c, i) => {
-        folder.file('page_' + String(i + 1).padStart(3, '0') + '.png', c.b64, { base64: true });
-        rawBytes += Math.round(c.b64.length * 0.75);
-      });
+    let lastPackProgress = 0;
+    const zipResult = await createZipBlobInWorker(chapters, batchLabel, (processed, total) => {
+      if (!total) return;
+      const pct = Math.floor(processed * 100 / total);
+      if (pct >= lastPackProgress + 10 || processed >= total) {
+        lastPackProgress = pct;
+        log(batchLabel + ' packing progress ' + Math.min(100, pct) + '% (' + processed + '/' + total + ')');
+      }
     });
-
-    log(batchLabel + ' input ~' + Math.round(rawBytes / 1024 / 1024) + 'MB, generating Blob...');
-    let zipBlob = await zip.generateAsync({
-      type: 'blob',
-      compression: 'STORE',
-      streamFiles: true,
-    });
-    const zipMB = (zipBlob.size / 1024 / 1024).toFixed(1);
+    log(batchLabel + ' input ~' + Math.round(zipResult.rawBytes / 1024 / 1024) +
+        'MB, ZIP ready by ' + zipResult.method);
+    let zipBlob = zipResult.blob;
+    const zipMB = zipResult.zipMB;
     const filename = mangaName + '_' + batchLabel + '_' + chapterCount + 'eps_' + totalPages + 'p.zip';
     releaseChapterPayloads(chapters);
 
