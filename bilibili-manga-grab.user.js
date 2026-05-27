@@ -383,7 +383,49 @@ async function runBiliMangaGrabber() {
 
   // 当前章节 ep_id（从 URL 提取），用于检测翻过头跨章
   const getEpFromUrl = () => location.pathname.split('/').filter(Boolean).pop();
+  // 从 reader UI 文本里抽取 "current/total" 页码指示（兼容 "1/62 P" 或 "1/62"）
+  const matchPageRatio = (text) => {
+    if (!text) return null;
+    let m = text.match(/(\d+)\s*\/\s*(\d+)\s*P\b/i);
+    if (!m) m = text.match(/\b(\d+)\s*\/\s*(\d+)\b/);
+    if (!m) return null;
+    const current = Number(m[1]);
+    const total = Number(m[2]);
+    if (!Number.isFinite(current) || !Number.isFinite(total)) return null;
+    if (current < 1 || total < 1 || current > total) return null;
+    return { current, total };
+  };
+  // 优先在 info-hud 内查找页码（更精确，避免 body 里日期 "1/12" 误匹配）；找不到再回退到全页扫描
+  const getDisplayedPageInfo = () => {
+    const containers = [
+      '.reader-layout .info-layer .info-hud',
+      '.info-hud',
+      '.info-text',
+    ];
+    for (const sel of containers) {
+      try {
+        const root = document.querySelector(sel);
+        if (!root) continue;
+        const text = (root.textContent || '').replace(/\s+/g, ' ').trim();
+        const info = matchPageRatio(text);
+        if (info) return info;
+      } catch (_) {}
+    }
+    try {
+      const text = (document.body.innerText || '').replace(/\s+/g, ' ');
+      // 全页兜底只接受带 P 的，避免日期等噪声
+      const m = text.match(/\b(\d+)\s*\/\s*(\d+)\s*P\b/i);
+      if (m) {
+        const current = Number(m[1]);
+        const total = Number(m[2]);
+        if (current >= 1 && total >= 1 && current <= total) return { current, total };
+      }
+    } catch (_) {}
+    return null;
+  };
   const getDisplayedTotalPages = () => {
+    const info = getDisplayedPageInfo();
+    if (info) return info.total;
     const text = document.body.innerText || '';
     const m = text.match(/(\d+)\s*P\b/i);
     return m ? Number(m[1]) : null;
@@ -497,49 +539,64 @@ async function runBiliMangaGrabber() {
     let completed = false; // true 表示本话已自然结束（跨章/抓满/stall 3 次）；false=被 STOP 中断
 
     // 回到本话首页：
-    //   - 一般情况下 PgUp 翻到上一页，到达本话第一页后再 PgUp 会跨到上一话（URL 变化），立即跳出
-    //   - 整部漫画第一话第一页：PgUp 既不会跨章也不会移动，必须靠 canvas 签名连续不变来短路退出
+    //   - 优先读取 reader UI 上的 "current/total" 页码指示器；已在 page 1 直接跳过 rewind
+    //   - 否则 PgUp 翻页：到达本话第一页后再 PgUp 会跨到上一话（URL 变化），立即跳出
+    //   - 整部漫画第一话第一页 PgUp 既不跨章也不移动，再用 canvas 签名连续不变作为兜底
     log('rewind to first page of ep=' + epId);
-    const initialRewindCap = await captureCanvasBytes();
-    let lastRewindSig = initialRewindCap?.sig || '';
-    let rewindStuckCount = 0;
     let rewindCount = 0;
-    for (let i = 0; i < total + 5; i++) {
-      if (stopRequested) {
-        return { epId, title, expectedPages: displayedTotal, captures, completed: false, endedOnEp: getEpFromUrl() };
+    const initialPageInfo = getDisplayedPageInfo();
+    if (initialPageInfo && initialPageInfo.current === 1) {
+      log('already at page 1/' + initialPageInfo.total + ' of ep=' + epId + ', skip rewind');
+    } else {
+      if (initialPageInfo) {
+        log('current page indicator ' + initialPageInfo.current + '/' + initialPageInfo.total + ', rewinding');
       }
-      const before = getEpFromUrl();
-      press('PageUp');
-      await sleep(300);
-      const after = getEpFromUrl();
-      if (after !== before) {
-        log('rewind crossed to prev ep=' + after + ', stepping forward back to ep=' + epId);
-        if (!(await returnToEp(epId, 'PageDown'))) {
-          return {
-            epId,
-            title,
-            expectedPages: displayedTotal,
-            captures,
-            completed: false,
-            endedOnEp: getEpFromUrl(),
-            navigationMismatch: true,
-          };
+      const initialRewindCap = await captureCanvasBytes();
+      let lastRewindSig = initialRewindCap?.sig || '';
+      let rewindStuckCount = 0;
+      for (let i = 0; i < total + 5; i++) {
+        if (stopRequested) {
+          return { epId, title, expectedPages: displayedTotal, captures, completed: false, endedOnEp: getEpFromUrl() };
         }
-        break;
-      }
-      rewindCount++;
-      const cap = await captureCanvasBytes();
-      if (cap) {
-        if (lastRewindSig && cap.sig === lastRewindSig) {
-          rewindStuckCount++;
-          if (rewindStuckCount >= 2) {
-            log('rewind: canvas unchanged for ' + (rewindStuckCount + 1) +
-                ' PageUps (' + rewindCount + ' steps), assuming first page of manga');
-            break;
+        const before = getEpFromUrl();
+        press('PageUp');
+        await sleep(300);
+        const after = getEpFromUrl();
+        if (after !== before) {
+          log('rewind crossed to prev ep=' + after + ', stepping forward back to ep=' + epId);
+          if (!(await returnToEp(epId, 'PageDown'))) {
+            return {
+              epId,
+              title,
+              expectedPages: displayedTotal,
+              captures,
+              completed: false,
+              endedOnEp: getEpFromUrl(),
+              navigationMismatch: true,
+            };
           }
-        } else {
-          rewindStuckCount = 0;
-          lastRewindSig = cap.sig;
+          break;
+        }
+        rewindCount++;
+        // 翻页后再读一次指示器，到达 page 1 即跳出（比抓 canvas 便宜）
+        const stepInfo = getDisplayedPageInfo();
+        if (stepInfo && stepInfo.current === 1) {
+          log('reached page 1/' + stepInfo.total + ' after ' + rewindCount + ' PageUps');
+          break;
+        }
+        const cap = await captureCanvasBytes();
+        if (cap) {
+          if (lastRewindSig && cap.sig === lastRewindSig) {
+            rewindStuckCount++;
+            if (rewindStuckCount >= 2) {
+              log('rewind: canvas unchanged for ' + (rewindStuckCount + 1) +
+                  ' PageUps (' + rewindCount + ' steps), assuming first page of manga');
+              break;
+            }
+          } else {
+            rewindStuckCount = 0;
+            lastRewindSig = cap.sig;
+          }
         }
       }
     }
