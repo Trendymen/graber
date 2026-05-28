@@ -561,6 +561,20 @@ async function runBiliMangaGrabber() {
       return m ? Number(m[1]) : null;
     } catch (_) { return null; }
   };
+  // 末话信号：reader 在最后一话按 PgDown 时会弹 .episode-toast "没有下一话啦"；
+  // 类似还会出现"没有上一话啦"等同款 toast，所以严格匹配"没有下一话"避免误判。
+  // 多个 .episode-toast 节点共存（不同方向），用 inline display:none 区分；这里跳过隐藏的。
+  const isAtLastChapter = () => {
+    try {
+      const toasts = document.querySelectorAll('.episode-toast');
+      for (const t of toasts) {
+        if (t.style && t.style.display === 'none') continue;
+        const text = (t.textContent || '').replace(/\s+/g, '');
+        if (/没有下一话/.test(text)) return true;
+      }
+    } catch (_) {}
+    return false;
+  };
   const returnToEp = async (epId, preferredKey) => {
     if (getEpFromUrl() === epId) return true;
     warn('returning to ep=' + epId + ' for retry...');
@@ -1451,19 +1465,28 @@ async function runBiliMangaGrabber() {
       continue;
     }
 
-    // 推进到下一话：每次按 PgDown 后自适应轮询 URL，单次最多 3s；
+    // 推进到下一话：每次按 PgDown 后轮询 URL，命中末话 toast ".episode-toast 没有下一话啦" 立即退出。
+    // 单次 deadline 递增 1.5s/1.5s/3s，3 次跑满共 6s 兜底，比原来固定 5×3s=15s 快很多。
     // URL 变化后再轮询 .current-page 直到显示 page 1（最多 2s），相比原先固定 800ms+1500ms 显著更快
     log('advancing to next chapter...');
     const advanceStart = Date.now();
     const epBefore = getEpFromUrl();
     let advanced = false;
-    for (let i = 0; i < 5 && !advanced; i++) {
+    let endOfManga = false;
+    const advanceDeadlines = [1500, 1500, 3000];
+    for (const ms of advanceDeadlines) {
+      if (advanced || endOfManga) break;
       press('PageDown');
-      const deadline = Date.now() + 3000;
+      const deadline = Date.now() + ms;
       while (Date.now() < deadline) {
         await sleep(80);
         if (getEpFromUrl() !== epBefore) { advanced = true; break; }
+        if (isAtLastChapter()) { endOfManga = true; break; }
       }
+    }
+    if (endOfManga) {
+      log('reader shows "没有下一话啦" toast, end of manga');
+      break;
     }
     if (!advanced) {
       log('could not advance past ep=' + epBefore + ', end of manga');
